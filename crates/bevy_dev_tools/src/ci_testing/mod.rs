@@ -89,9 +89,11 @@ impl Plugin for CiTestingPlugin {
                     .ambiguous_with_all(),
             );
 
-        // The offending system does not exist in the wasm32 target.
-        // As a result, we must conditionally order the two systems using a system set.
-        #[cfg(any(unix, windows))]
+        // Order these systems only on targets with a terminal Ctrl+C handler.
+        #[cfg(any(
+            all(unix, not(any(target_os = "horizon", target_os = "tvos"))),
+            windows
+        ))]
         app.configure_sets(
             Update,
             EventSenderSystems.before(bevy_app::TerminalCtrlCHandlerPlugin::exit_on_flag),

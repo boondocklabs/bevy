@@ -23,7 +23,7 @@ plugin_group! {
         #[cfg(feature = "bevy_window")]
         bevy_a11y:::AccessibilityPlugin,
         #[cfg(feature = "std")]
-        #[custom(cfg(any(all(unix, not(target_os = "horizon")), windows)))]
+        #[custom(cfg(any(all(unix, not(any(target_os = "horizon", target_os = "tvos"))), windows)))]
         bevy_app:::TerminalCtrlCHandlerPlugin,
         // NOTE: Load this before AssetPlugin to properly register http asset sources.
         #[cfg(feature = "bevy_asset")]

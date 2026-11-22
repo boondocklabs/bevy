@@ -146,7 +146,10 @@ impl Plugin for WinitPlugin {
 
         // Wake up the event loop when `Ctrl+C` is received so that the app can
         // exit even while idle in a reactive update mode
-        #[cfg(any(all(unix, not(target_os = "horizon")), windows))]
+        #[cfg(any(
+            all(unix, not(any(target_os = "horizon", target_os = "tvos"))),
+            windows
+        ))]
         {
             let event_loop_proxy = event_loop_proxy.clone();
             bevy_app::TerminalCtrlCHandlerPlugin::register_exit_handler(move || {
