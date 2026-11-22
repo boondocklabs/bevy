@@ -4,13 +4,12 @@ use alloc::{collections::VecDeque, sync::Arc};
 use bevy_input_focus::InputFocus;
 use core::cell::RefCell;
 use std::sync::Mutex;
-use winit::event_loop::ActiveEventLoop;
+use winit::{event::WindowEvent, event_loop::ActiveEventLoop};
 
 use accesskit::{
     ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, Role,
     TreeId, TreeInfo, TreeUpdate,
 };
-use accesskit_winit::Adapter;
 use bevy_a11y::{
     AccessibilityNode, AccessibilityRequested, AccessibilitySystems,
     ActionRequest as ActionRequestWrapper, ManageAccessibilityUpdates,
@@ -131,10 +130,219 @@ impl DeactivationHandler for WinitDeactivationHandler {
     fn deactivate_accessibility(&mut self) {}
 }
 
+// AccessKit's winit adapter still uses winit 0.30. Use the same platform
+// adapters directly so these windows and events use only winit 0.31.
+#[cfg(target_os = "macos")]
+type PlatformAdapter = accesskit_macos::SubclassingAdapter;
+#[cfg(target_os = "ios")]
+type PlatformAdapter = accesskit_ios::SubclassingAdapter;
+#[cfg(target_os = "windows")]
+type PlatformAdapter = accesskit_windows::SubclassingAdapter;
+#[cfg(all(
+    feature = "accesskit_unix",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+type PlatformAdapter = accesskit_unix::Adapter;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    all(
+        feature = "accesskit_unix",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )
+    )
+)))]
+type PlatformAdapter = ();
+
+/// Connects a Bevy accessibility tree to the window's platform adapter.
+pub struct Adapter(Option<PlatformAdapter>);
+
+impl Adapter {
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "ios"),
+        expect(unsafe_code, reason = "AccessKit requires a native view pointer")
+    )]
+    fn new(
+        _window: &dyn winit::window::Window,
+        _activation: WinitActivationHandler,
+        _action: WinitActionHandler,
+        _deactivation: WinitDeactivationHandler,
+    ) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(handle) = _window.window_handle()
+                && let RawWindowHandle::AppKit(handle) = handle.as_raw()
+            {
+                // SAFETY: Winit supplied a live NSView and this runs on the
+                // main thread, before making the window visible.
+                return Self(Some(unsafe {
+                    PlatformAdapter::new(handle.ns_view.as_ptr(), _activation, _action)
+                }));
+            }
+            Self(None)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            if let Ok(handle) = _window.window_handle()
+                && let RawWindowHandle::UiKit(handle) = handle.as_raw()
+            {
+                // SAFETY: Winit supplied a live UIView and this runs on the
+                // main thread, before making the window visible.
+                return Self(Some(unsafe {
+                    PlatformAdapter::new(
+                        handle.ui_view.as_ptr(),
+                        _activation,
+                        _action,
+                        _deactivation,
+                    )
+                }));
+            }
+            Self(None)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(handle) = _window.window_handle()
+                && let RawWindowHandle::Win32(handle) = handle.as_raw()
+            {
+                let hwnd = accesskit_windows::HWND(handle.hwnd.get() as *mut _);
+                return Self(Some(PlatformAdapter::new(hwnd, _activation, _action)));
+            }
+            Self(None)
+        }
+        #[cfg(all(
+            feature = "accesskit_unix",
+            any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )
+        ))]
+        {
+            Self(Some(PlatformAdapter::new(
+                _activation,
+                _action,
+                _deactivation,
+            )))
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "windows",
+            all(
+                feature = "accesskit_unix",
+                any(
+                    target_os = "linux",
+                    target_os = "dragonfly",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                )
+            )
+        )))]
+        Self(None)
+    }
+
+    fn update_if_active(&mut self, _updater: impl FnOnce() -> TreeUpdate) {
+        let _platform_adapter = &mut self.0;
+
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
+        if let Some(adapter) = _platform_adapter
+            && let Some(events) = adapter.update_if_active(_updater)
+        {
+            events.raise();
+        }
+
+        #[cfg(all(
+            feature = "accesskit_unix",
+            any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )
+        ))]
+        if let Some(adapter) = _platform_adapter {
+            adapter.update_if_active(_updater);
+        }
+    }
+
+    /// Lets the platform adapter observe winit events before other systems.
+    pub fn process_event(&mut self, _window: &dyn winit::window::Window, _event: &WindowEvent) {
+        #[cfg(target_os = "macos")]
+        if let (Some(adapter), WindowEvent::Focused(focused)) = (&mut self.0, _event)
+            && let Some(events) = adapter.update_view_focus_state(*focused)
+        {
+            events.raise();
+        }
+
+        #[cfg(all(
+            feature = "accesskit_unix",
+            any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )
+        ))]
+        if let Some(adapter) = &mut self.0 {
+            use accesskit::Rect;
+
+            match _event {
+                WindowEvent::Moved(_) | WindowEvent::SurfaceResized(_) => {
+                    let (outer_position, surface_size) = match _event {
+                        WindowEvent::Moved(position) => (*position, _window.surface_size()),
+                        WindowEvent::SurfaceResized(size) => {
+                            (_window.outer_position().unwrap_or_default(), *size)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let outer_position = outer_position.cast::<f64>();
+                    let surface_offset = _window.surface_position().cast::<f64>();
+                    let surface_position = (
+                        outer_position.x + surface_offset.x,
+                        outer_position.y + surface_offset.y,
+                    );
+                    adapter.set_root_window_bounds(
+                        Rect::from_origin_size(
+                            <(f64, f64)>::from(outer_position),
+                            <(f64, f64)>::from(_window.outer_size().cast::<f64>()),
+                        ),
+                        Rect::from_origin_size(
+                            surface_position,
+                            <(f64, f64)>::from(surface_size.cast::<f64>()),
+                        ),
+                    );
+                }
+                WindowEvent::Focused(focused) => adapter.update_window_focus_state(*focused),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Prepares accessibility for a winit window.
 pub(crate) fn prepare_accessibility_for_window(
-    event_loop: &ActiveEventLoop,
-    winit_window: &winit::window::Window,
+    _event_loop: &dyn ActiveEventLoop,
+    winit_window: &dyn winit::window::Window,
     entity: Entity,
     name: String,
     accessibility_requested: AccessibilityRequested,
@@ -148,8 +356,7 @@ pub(crate) fn prepare_accessibility_for_window(
     let action_handler = WinitActionHandler::new(Arc::clone(&action_request_handler));
     let deactivation_handler = WinitDeactivationHandler;
 
-    let adapter = Adapter::with_direct_handlers(
-        event_loop,
+    let adapter = Adapter::new(
         winit_window,
         activation_handler,
         action_handler,

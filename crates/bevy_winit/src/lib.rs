@@ -1,5 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![doc(
     html_logo_url = "https://bevy.org/assets/icon.png",
     html_favicon_url = "https://bevy.org/assets/icon.png"
@@ -18,6 +18,7 @@ use bevy_derive::Deref;
 use bevy_reflect::Reflect;
 use bevy_window::{ExitSystems, RawHandleWrapperHolder, WindowEvent};
 use core::cell::RefCell;
+use std::sync::mpsc;
 use winit::{event_loop::EventLoop, window::WindowId};
 
 use bevy_a11y::AccessibilityRequested;
@@ -26,11 +27,9 @@ use bevy_ecs::prelude::*;
 use bevy_window::{CursorOptions, Window, WindowCreated};
 use system::{changed_cursor_options, changed_windows, check_keyboard_focus_lost, despawn_windows};
 pub use system::{create_monitors, create_windows};
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub use winit::platform::web::CustomCursorExtWebSys;
 pub use winit::{
+    cursor::{CustomCursor as WinitCustomCursor, CustomCursorSource},
     event_loop::EventLoopProxy,
-    window::{CustomCursor as WinitCustomCursor, CustomCursorSource},
 };
 pub use winit_config::*;
 pub use winit_monitors::*;
@@ -44,6 +43,7 @@ use crate::{
 pub mod accessibility;
 pub mod converters;
 mod cursor;
+mod drag_and_drop;
 #[cfg(all(target_os = "linux", feature = "linux_game_mode"))]
 mod game_mode;
 mod state;
@@ -84,7 +84,7 @@ impl Plugin for WinitPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        let mut event_loop_builder = EventLoop::<WinitUserEvent>::with_user_event();
+        let mut event_loop_builder = EventLoop::builder();
 
         // linux check is needed because x11 might be enabled on other platforms.
         #[cfg(all(target_os = "linux", feature = "x11"))]
@@ -138,7 +138,11 @@ impl Plugin for WinitPlugin {
             .build()
             .expect("Failed to build event loop");
 
-        let event_loop_proxy = event_loop.create_proxy();
+        let (sender, receiver) = mpsc::channel();
+        let event_loop_proxy = EventLoopProxyWrapper {
+            proxy: event_loop.create_proxy(),
+            sender,
+        };
 
         // Wake up the event loop when `Ctrl+C` is received so that the app can
         // exit even while idle in a reactive update mode
@@ -153,9 +157,9 @@ impl Plugin for WinitPlugin {
         app.init_resource::<WinitMonitors>()
             .init_resource::<WinitSettings>()
             .insert_resource(DisplayHandleWrapper(event_loop.owned_display_handle()))
-            .insert_resource(EventLoopProxyWrapper(event_loop_proxy))
+            .insert_resource(event_loop_proxy)
             .add_message::<RawWinitWindowEvent>()
-            .set_runner(|app| winit_runner(app, event_loop))
+            .set_runner(move |app| winit_runner(app, event_loop, receiver))
             .add_systems(
                 Last,
                 (
@@ -222,14 +226,26 @@ pub struct RawWinitWindowEvent {
     pub event: winit::event::WindowEvent,
 }
 
-/// A wrapper type around [`winit::event_loop::EventLoopProxy`] with the specific
-/// [`winit::event::Event::UserEvent`] used in the [`WinitPlugin`].
+/// An event sender backed by a [`winit::event_loop::EventLoopProxy`] and a queue
+/// of Bevy-specific [`WinitUserEvent`]s.
 ///
 /// The `EventLoopProxy` can be used to request a redraw from outside bevy.
 ///
 /// Use `Res<EventLoopProxyWrapper>` to retrieve this resource.
-#[derive(Resource, Deref)]
-pub struct EventLoopProxyWrapper(EventLoopProxy<WinitUserEvent>);
+#[derive(Resource, Clone)]
+pub struct EventLoopProxyWrapper {
+    proxy: EventLoopProxy,
+    sender: mpsc::Sender<WinitUserEvent>,
+}
+
+impl EventLoopProxyWrapper {
+    /// Queues a payload and wakes the Winit loop. Returns an error if the loop has closed.
+    pub fn send_event(&self, event: WinitUserEvent) -> Result<(), mpsc::SendError<WinitUserEvent>> {
+        self.sender.send(event)?;
+        self.proxy.wake_up();
+        Ok(())
+    }
+}
 
 /// A wrapper around [`winit::event_loop::OwnedDisplayHandle`]
 ///

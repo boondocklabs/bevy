@@ -149,6 +149,29 @@ impl ExtractedWindow {
     }
 }
 
+/// Android requires old surfaces to be released before its native callback returns.
+#[cfg(target_os = "android")]
+pub(crate) fn release_invalidated_surfaces(main_world: &World, render_world: &mut World) {
+    // A pipelined renderer is back on the main thread during pre-extraction,
+    // but its extract commands would not apply until the next render frame.
+    // Remove just the invalidated window data here, including in recovery mode.
+    let mut query = render_world.query_filtered::<(Entity, &MainEntity), With<ExtractedWindow>>();
+    let invalidated = query
+        .iter(render_world)
+        .filter_map(|(render_entity, main_entity)| {
+            main_world
+                .get::<RawHandleWrapper>(main_entity.id())
+                .is_none()
+                .then_some(render_entity)
+        })
+        .collect::<Vec<_>>();
+    for entity in invalidated {
+        render_world
+            .entity_mut(entity)
+            .remove::<(ExtractedWindow, RawHandleWrapper, SurfaceData)>();
+    }
+}
+
 fn extract_windows(
     mut commands: Commands,
     mut extracted_windows: Query<&mut ExtractedWindow>,

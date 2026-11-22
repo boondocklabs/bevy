@@ -12,14 +12,15 @@ use bevy_ecs::{
 use bevy_input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput};
 use bevy_window::{
     ClosingWindow, CursorOptions, HasWindows, Monitor, OnMonitor, PrimaryMonitor, RawHandleWrapper,
-    VideoMode, Window, WindowClosed, WindowClosing, WindowCreated, WindowEvent, WindowFocused,
-    WindowMode, WindowScaleFactorChanged, WindowWrapper,
+    Window, WindowClosed, WindowClosing, WindowCreated, WindowEvent, WindowFocused, WindowMode,
+    WindowScaleFactorChanged, WindowWrapper,
 };
 use tracing::{error, info, warn};
 
 use winit::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
     event_loop::ActiveEventLoop,
+    window::{ImeCapabilities, ImeEnableRequest, ImeHint, ImePurpose, ImeRequest, ImeRequestData},
 };
 
 use crate::{
@@ -31,15 +32,16 @@ use crate::{
     resolve_exclusive_fullscreen, select_monitor,
     state::react_to_resize,
     winit_monitors::WinitMonitors,
+    winit_windows::convert_video_mode,
     CreateMonitorParams, CreateWindowParams, WINIT_WINDOWS,
 };
 use bevy_app::AppExit;
 use bevy_ecs::{prelude::MessageReader, query::With, system::Res};
-use bevy_math::{IVec2, UVec2};
+use bevy_math::{IVec2, Vec2};
 #[cfg(target_os = "ios")]
 use winit::platform::ios::WindowExtIOS;
 #[cfg(target_arch = "wasm32")]
-use winit::platform::web::WindowExtWebSys;
+use winit::platform::web::WindowExtWeb;
 
 /// Creates new windows on the [`winit`] backend for each entity with a newly-added
 /// [`Window`] component.
@@ -47,7 +49,7 @@ use winit::platform::web::WindowExtWebSys;
 /// If any of these entities are missing required components, those will be added with their
 /// default values.
 pub fn create_windows(
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
     (
         mut commands,
         mut created_windows,
@@ -179,7 +181,7 @@ pub(crate) fn check_keyboard_focus_lost(
 
 /// Synchronize available monitors as reported by [`winit`] with [`Monitor`] entities in the world.
 pub fn create_monitors(
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
     (mut commands, mut monitors): SystemParamItem<CreateMonitorParams>,
 ) {
     let primary_monitor = event_loop.primary_monitor();
@@ -193,28 +195,23 @@ pub fn create_monitors(
             }
         }
 
-        let size = monitor.size();
-        let position = monitor.position();
+        let current_mode = monitor.current_video_mode();
+        // Winit may not report the mode or desktop position, e.g. without browser permissions.
+        // Bevy's monitor type represents these unavailable integer values with zero.
+        let size = current_mode.map_or_else(PhysicalSize::default, |mode| mode.size());
+        let position = monitor.position().unwrap_or_default();
 
         let entity = commands
             .spawn(Monitor {
-                name: monitor.name(),
+                name: monitor.name().map(|name| name.into_owned()),
                 physical_height: size.height,
                 physical_width: size.width,
                 physical_position: IVec2::new(position.x, position.y),
-                refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
+                refresh_rate_millihertz: current_mode
+                    .and_then(|mode| mode.refresh_rate_millihertz())
+                    .map(|rate| rate.get()),
                 scale_factor: monitor.scale_factor(),
-                video_modes: monitor
-                    .video_modes()
-                    .map(|v| {
-                        let size = v.size();
-                        VideoMode {
-                            physical_size: UVec2::new(size.width, size.height),
-                            bit_depth: v.bit_depth(),
-                            refresh_rate_millihertz: v.refresh_rate_millihertz(),
-                        }
-                    })
-                    .collect(),
+                video_modes: monitor.video_modes().map(convert_video_mode).collect(),
             })
             .id();
 
@@ -253,7 +250,7 @@ pub(crate) fn despawn_windows(
     window_entities: Query<Entity, With<Window>>,
     mut closing_event_writer: MessageWriter<WindowClosing>,
     mut closed_event_writer: MessageWriter<WindowClosed>,
-    mut windows_to_drop: Local<Vec<WindowWrapper<winit::window::Window>>>,
+    mut windows_to_drop: Local<Vec<WindowWrapper<Box<dyn winit::window::Window>>>>,
     mut exit_event_reader: MessageReader<AppExit>,
     _non_send_marker: NonSendMarker,
 ) {
@@ -336,7 +333,7 @@ pub(crate) fn changed_windows(
             if window.mode != cache.mode {
                 let new_mode = match window.mode {
                     WindowMode::BorderlessFullscreen(monitor_selection) => {
-                        Some(Some(winit::window::Fullscreen::Borderless(select_monitor(
+                        Some(Some(winit::monitor::Fullscreen::Borderless(select_monitor(
                             &monitors,
                             winit_window.primary_monitor(),
                             winit_window.current_monitor(),
@@ -381,7 +378,7 @@ pub(crate) fn changed_windows(
                     };
 
                     if should_set {
-                        winit_window.set_outer_position(position);
+                        winit_window.set_outer_position(position.into());
                     }
                 }
 
@@ -396,8 +393,8 @@ pub(crate) fn changed_windows(
                 );
 
                 if cache_physical_size != requested_physical_size {
-                    // In `None` case, the request will be handled by winit::event::WindowEvent::Resized
-                    if let Some(new_physical_size) = winit_window.request_inner_size(requested_physical_size) {
+                    // In `None` case, the request will be handled by winit::event::WindowEvent::SurfaceResized
+                    if let Some(new_physical_size) = winit_window.request_surface_size(requested_physical_size.into()) {
                         let event = react_to_resize(entity, &mut window, new_physical_size);
                         window_event.write(event.into());
                     }
@@ -420,7 +417,7 @@ pub(crate) fn changed_windows(
             {
                 let position = PhysicalPosition::new(requested_position.x, requested_position.y);
 
-                if let Err(err) = winit_window.set_cursor_position(position) {
+                if let Err(err) = winit_window.set_cursor_position(position.into()) {
                     error!("could not set cursor position: {}", err);
                 }
             }
@@ -443,19 +440,19 @@ pub(crate) fn changed_windows(
 
             if window.resize_constraints != cache.resize_constraints {
                 let constraints = window.resize_constraints.check_constraints();
-                let min_inner_size = LogicalSize {
+                let min_surface_size = LogicalSize {
                     width: constraints.min_width,
                     height: constraints.min_height,
                 };
-                let max_inner_size = LogicalSize {
+                let max_surface_size = LogicalSize {
                     width: constraints.max_width,
                     height: constraints.max_height,
                 };
 
-                winit_window.set_min_inner_size(Some(min_inner_size));
-                winit_window.set_max_inner_size(
+                winit_window.set_min_surface_size(Some(min_surface_size.into()));
+                winit_window.set_max_surface_size(
                     if constraints.max_width.is_finite() && constraints.max_height.is_finite() {
-                        Some(max_inner_size)
+                        Some(max_surface_size.into())
                     } else {
                         None
                     },
@@ -523,14 +520,20 @@ pub(crate) fn changed_windows(
             }
 
             if window.ime_enabled != cache.ime_enabled {
-                winit_window.set_ime_allowed(window.ime_enabled);
-            }
-
-            if window.ime_position != cache.ime_position {
-                winit_window.set_ime_cursor_area(
-                    LogicalPosition::new(window.ime_position.x, window.ime_position.y),
-                    PhysicalSize::new(10, 10),
-                );
+                if window.ime_enabled {
+                    let capabilities = ImeCapabilities::new().with_hint_and_purpose().with_cursor_area();
+                    let data = ime_cursor_area(window.ime_position)
+                        .with_hint_and_purpose(ImeHint::NONE, ImePurpose::Normal);
+                    let request = ImeEnableRequest::new(capabilities, data)
+                        .expect("IME capabilities match the request data");
+                    let _ = winit_window.request_ime_update(ImeRequest::Enable(request));
+                } else {
+                    let _ = winit_window.request_ime_update(ImeRequest::Disable);
+                }
+            } else if window.ime_position != cache.ime_position
+                && winit_window.ime_capabilities().is_some_and(|caps| caps.cursor_area())
+            {
+                let _ = winit_window.request_ime_update(ImeRequest::Update(ime_cursor_area(window.ime_position)));
             }
 
             if window.window_theme != cache.window_theme {
@@ -587,6 +590,13 @@ pub(crate) fn changed_windows(
     });
 }
 
+fn ime_cursor_area(position: Vec2) -> ImeRequestData {
+    ImeRequestData::default().with_cursor_area(
+        LogicalPosition::new(position.x, position.y).into(),
+        PhysicalSize::new(10, 10).into(),
+    )
+}
+
 pub(crate) fn changed_cursor_options(
     mut changed_windows: Query<
         (
@@ -608,7 +618,7 @@ pub(crate) fn changed_cursor_options(
             };
             // Don't check the cache for the grab mode. It can change through external means, leaving the cache outdated.
             if let Err(err) =
-                crate::winit_windows::attempt_grab(winit_window, cursor_options.grab_mode)
+                crate::winit_windows::attempt_grab(winit_window.as_ref(), cursor_options.grab_mode)
             {
                 warn!(
                     "Could not set cursor grab mode for window {}: {}",

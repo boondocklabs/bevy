@@ -395,7 +395,11 @@ impl Plugin for RenderPlugin {
             // We only create the render world and set up extraction if we
             // have a rendering backend available.
             app.add_plugins(ExtractPlugin::<RenderApp>::new(
-                error_handler::update_state,
+                |main_world, render_world| {
+                    #[cfg(target_os = "android")]
+                    view::window::release_invalidated_surfaces(main_world, render_world);
+                    error_handler::update_state(main_world, render_world);
+                },
                 Render::base_schedule,
                 Render.intern(),
                 RenderSystems::ExtractCommands.intern(),

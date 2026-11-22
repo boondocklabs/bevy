@@ -14,8 +14,8 @@ trace = []
 wayland = ["winit/wayland", "winit/wayland-csd-adwaita"]
 x11 = ["winit/x11"]
 accesskit_unix = [
-  "accesskit_winit/accesskit_unix",
-  "accesskit_winit/async-io",
+  "dep:accesskit_unix",
+  "accesskit_unix/async-io",
   "bevy_tasks/async-io",
 ]
 
@@ -64,16 +64,30 @@ wgpu-types = { version = "30", optional = true }
 bytemuck = { version = "1.5", optional = true }
 
 # other
-# feature rwh_06 refers to window_raw_handle@v0.6
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-accesskit_winit = { version = "0.34", default-features = false, features = [
-  "rwh_06",
-] }
+winit = { version = "=0.31.0-beta.4", default-features = false }
 approx = { version = "0.5", default-features = false }
 accesskit = "0.25"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 zbus = { version = "5.13", optional = true }
+
+[target.'cfg(any(unix, windows, target_os = "redox"))'.dependencies]
+url = "2.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit_macos = "0.27"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+accesskit_ios = "0.2"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+accesskit_windows = "0.35"
+raw-window-handle = "0.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+accesskit_unix = { version = "0.24", default-features = false, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 bevy_android = { path = "../bevy_android", version = "0.20.0-dev", default-features = false }
