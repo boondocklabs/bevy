@@ -1,6 +1,6 @@
 use super::{GpuArrayBufferIndex, GpuArrayBufferable};
 use crate::{
-    render_resource::DynamicUniformBuffer,
+    render_resource::{Buffer, DynamicUniformBuffer},
     renderer::{RenderDevice, RenderQueue},
 };
 use core::{marker::PhantomData, num::NonZero};
@@ -106,6 +106,12 @@ impl<T: GpuArrayBufferable> BatchedUniformBuffer<T> {
             self.flush();
         }
         self.uniforms.write_buffer(device, queue);
+    }
+
+    /// Returns the GPU buffer backing this uniform buffer, if allocated.
+    #[inline]
+    pub fn buffer(&self) -> Option<&Buffer> {
+        self.uniforms.buffer()
     }
 
     #[inline]

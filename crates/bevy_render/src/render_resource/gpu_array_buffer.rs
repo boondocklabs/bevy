@@ -3,7 +3,7 @@ use bevy_material::bind_group_layout_entries::{
     BindGroupLayoutEntryBuilder,
 };
 
-use super::BufferVec;
+use super::{Buffer, BufferVec};
 use crate::{
     render_resource::batched_uniform_buffer::BatchedUniformBuffer,
     renderer::{RenderDevice, RenderQueue},
@@ -87,6 +87,14 @@ impl<T: GpuArrayBufferable> GpuArrayBuffer<T> {
             )
         } else {
             storage_buffer_read_only::<T>(false)
+        }
+    }
+
+    /// Returns the GPU buffer backing this array, if allocated.
+    pub fn buffer(&self) -> Option<&Buffer> {
+        match self {
+            Self::Uniform(buffer) => buffer.buffer(),
+            Self::Storage(buffer) => buffer.buffer(),
         }
     }
 

@@ -916,6 +916,59 @@ pub struct Mesh2dBindGroup {
     pub value: HashMap<MeshSlabId, BindGroup>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mesh2dBindGroupKey {
+    layout: BindGroupLayoutId,
+    instance_buffer: BufferId,
+    instance_offset: BufferAddress,
+    instance_size: Option<BufferSize>,
+    metadata_buffer: BufferId,
+}
+
+#[derive(Clone, Copy)]
+struct CachedMesh2dBindGroup {
+    key: Mesh2dBindGroupKey,
+    group: BindGroupId,
+    generation: u64,
+}
+
+/// Local descriptor cache for the Mesh2d bind group preparation system.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct Mesh2dBindGroupCache {
+    generation: u64,
+    groups: HashMap<MeshSlabId, CachedMesh2dBindGroup>,
+}
+
+impl Mesh2dBindGroupCache {
+    fn keep_cached(
+        &mut self,
+        slab: MeshSlabId,
+        key: Mesh2dBindGroupKey,
+        published: Option<BindGroupId>,
+    ) -> bool {
+        let Some(entry) = self.groups.get_mut(&slab) else {
+            return false;
+        };
+        if entry.key != key || Some(entry.group) != published {
+            return false;
+        }
+        entry.generation = self.generation;
+        true
+    }
+
+    fn prune(&mut self, mut remove: impl FnMut(MeshSlabId, BindGroupId)) {
+        self.groups.retain(|&slab, group| {
+            if group.generation == self.generation {
+                true
+            } else {
+                remove(slab, group.group);
+                false
+            }
+        });
+    }
+}
+
 pub fn prepare_mesh2d_bind_group(
     mesh2d_pipeline: Res<Mesh2dPipeline>,
     render_device: Res<RenderDevice>,
@@ -924,32 +977,175 @@ pub fn prepare_mesh2d_bind_group(
     mesh_allocator: Res<MeshAllocator>,
     mut mesh2d_bind_group: ResMut<Mesh2dBindGroup>,
     metadata_fallback_buffer: Res<MeshMetadataFallbackBuffer>,
+    mut cache: Local<Mesh2dBindGroupCache>,
 ) {
-    let Some(binding) = mesh2d_uniforms.instance_data_binding() else {
+    cache.generation = cache.generation.wrapping_add(1);
+    let (Some(BindingResource::Buffer(binding)), Some(instance_buffer)) = (
+        mesh2d_uniforms.instance_data_binding(),
+        mesh2d_uniforms.buffer(),
+    ) else {
+        prune_mesh2d_bind_groups(&mut cache, &mut mesh2d_bind_group);
         return;
     };
+
+    let layout = pipeline_cache.get_bind_group_layout(&mesh2d_pipeline.mesh_layout);
     for metadata_slab_id in mesh_allocator.metadata_slabs() {
         let metadata_buffer = mesh_allocator
             .buffer_for_slab(metadata_slab_id)
             .unwrap_or(&metadata_fallback_buffer.buffer);
-        mesh2d_bind_group.value.insert(
-            metadata_slab_id,
-            render_device.create_bind_group(
-                "mesh2d_bind_group",
-                &pipeline_cache.get_bind_group_layout(&mesh2d_pipeline.mesh_layout),
-                &BindGroupEntries::with_indices((
-                    (0, binding.clone()),
-                    (
-                        1,
-                        BindingResource::Buffer(BufferBinding {
-                            buffer: metadata_buffer,
-                            offset: 0,
-                            size: None,
-                        }),
-                    ),
-                )),
-            ),
+        let key = Mesh2dBindGroupKey {
+            layout: layout.id(),
+            instance_buffer: instance_buffer.id(),
+            instance_offset: binding.offset,
+            instance_size: binding.size,
+            metadata_buffer: metadata_buffer.id(),
+        };
+        let published = mesh2d_bind_group
+            .value
+            .get(&metadata_slab_id)
+            .map(BindGroup::id);
+        if cache.keep_cached(metadata_slab_id, key, published) {
+            continue;
+        }
+        let group = render_device.create_bind_group(
+            "mesh2d_bind_group",
+            &layout,
+            &BindGroupEntries::with_indices((
+                (0, BindingResource::Buffer(binding.clone())),
+                (
+                    1,
+                    BindingResource::Buffer(BufferBinding {
+                        buffer: metadata_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                ),
+            )),
         );
+        let generation = cache.generation;
+        cache.groups.insert(
+            metadata_slab_id,
+            CachedMesh2dBindGroup {
+                key,
+                group: group.id(),
+                generation,
+            },
+        );
+        mesh2d_bind_group.value.insert(metadata_slab_id, group);
+    }
+    prune_mesh2d_bind_groups(&mut cache, &mut mesh2d_bind_group);
+}
+
+fn prune_mesh2d_bind_groups(
+    cache: &mut Mesh2dBindGroupCache,
+    mesh2d_bind_group: &mut ResMut<Mesh2dBindGroup>,
+) {
+    cache.prune(|slab, group| {
+        // Do not remove entries a client has replaced in the public map.
+        if mesh2d_bind_group.value.get(&slab).map(BindGroup::id) == Some(group) {
+            mesh2d_bind_group.value.remove(&slab);
+        }
+    });
+}
+
+#[cfg(test)]
+mod mesh2d_bind_group_cache_tests {
+    use super::*;
+
+    fn fixture() -> (
+        Mesh2dBindGroupCache,
+        MeshSlabId,
+        Mesh2dBindGroupKey,
+        BindGroupId,
+    ) {
+        let mut cache = Mesh2dBindGroupCache::default();
+        let slab = MeshSlabId::default();
+        let key = Mesh2dBindGroupKey {
+            layout: BindGroupLayoutId::new(),
+            instance_buffer: BufferId::new(),
+            instance_offset: 0,
+            instance_size: None,
+            metadata_buffer: BufferId::new(),
+        };
+        let group = BindGroupId::new();
+        cache.groups.insert(
+            slab,
+            CachedMesh2dBindGroup {
+                key,
+                group,
+                generation: cache.generation,
+            },
+        );
+        cache.generation += 1;
+        (cache, slab, key, group)
+    }
+
+    #[test]
+    fn reuses_unchanged_resources_and_published_group() {
+        let (mut cache, slab, key, group) = fixture();
+        assert!(cache.keep_cached(slab, key, Some(group)));
+        cache.prune(|_, _| panic!("unchanged group was pruned"));
+        assert_eq!(cache.groups.len(), 1);
+    }
+
+    #[test]
+    fn changes_in_layout_instance_buffer_range_or_metadata_require_rebinding() {
+        let (mut cache, slab, key, group) = fixture();
+        for changed in [
+            Mesh2dBindGroupKey {
+                layout: BindGroupLayoutId::new(),
+                ..key
+            },
+            Mesh2dBindGroupKey {
+                instance_buffer: BufferId::new(),
+                ..key
+            },
+            Mesh2dBindGroupKey {
+                instance_offset: 256,
+                ..key
+            },
+            Mesh2dBindGroupKey {
+                instance_size: BufferSize::new(256),
+                ..key
+            },
+            // A fallback-to-real transition is just another effective buffer change.
+            Mesh2dBindGroupKey {
+                metadata_buffer: BufferId::new(),
+                ..key
+            },
+        ] {
+            assert!(!cache.keep_cached(slab, changed, Some(group)));
+        }
+        assert!(!cache.keep_cached(slab, key, Some(BindGroupId::new())));
+        assert!(!cache.keep_cached(slab, key, None));
+    }
+
+    #[test]
+    fn prunes_unseen_groups_without_touching_active_groups() {
+        let (mut cache, live, key, group) = fixture();
+        let mut retired = MeshSlabId::default();
+        retired.id = NonMaxU32::new(1).unwrap();
+        let retired_group = BindGroupId::new();
+        cache.groups.insert(
+            retired,
+            CachedMesh2dBindGroup {
+                key,
+                group: retired_group,
+                generation: 0,
+            },
+        );
+        assert!(cache.keep_cached(live, key, Some(group)));
+        let mut pruned = Vec::new();
+        cache.prune(|slab, group| pruned.push((slab, group)));
+        assert_eq!(pruned, [(retired, retired_group)]);
+        assert_eq!(cache.groups.len(), 1);
+
+        // No live instances/resource binding leaves nothing marked this frame.
+        cache.generation += 1;
+        pruned.clear();
+        cache.prune(|slab, group| pruned.push((slab, group)));
+        assert_eq!(pruned, [(live, group)]);
+        assert!(cache.groups.is_empty());
     }
 }
 
